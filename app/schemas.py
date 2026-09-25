@@ -212,6 +212,95 @@ class DefectQueueOut(BaseModel):
     )
 
 
+# ---------- 胶卷交付核验 ----------
+
+class DeliveryBlockingOut(BaseModel):
+    """三类阻断项：任一非空即阻断交付，不签发凭证。"""
+
+    missing_ranges: list[list[int]] = Field(
+        ..., description="预期覆盖内的连续缺帧闭区间"
+    )
+    out_of_range_frames: list[int] = Field(
+        ..., description="落在全部预期范围之外的实扫帧（去重排序）"
+    )
+    defect_frames: list[DefectQueueItem] = Field(
+        ..., description="全部有效扫描出现均被标记瑕疵的帧（按帧号升序）"
+    )
+
+
+class DeliveryDefectMarkOut(BaseModel):
+    batch_id: str = Field(..., description="瑕疵标记所属批次")
+    position: int = Field(
+        ..., description="瑕疵在该批原始帧列表中的位置（0 起算）"
+    )
+    defect_type: DefectType
+
+
+class DeliveryBasisOut(BaseModel):
+    """核验依据：签发时随凭证冻结入库，之后不随批次或瑕疵变化改写。"""
+
+    expected_ranges: list[list[int]] = Field(
+        ..., description="核验时的合并预期覆盖闭区间"
+    )
+    frames: list[int] = Field(..., description="核验时的实扫帧（去重排序）")
+    missing_ranges: list[list[int]] = Field(
+        ..., description="核验时预期内缺帧闭区间（已签发的凭证中必为空）"
+    )
+    out_of_range_frames: list[int] = Field(
+        ..., description="核验时预期外帧（已签发的凭证中必为空）"
+    )
+    defect_frames: list[DefectQueueItem] = Field(
+        ..., description="核验时全部出现均被标记瑕疵的帧（已签发的凭证中必为空）"
+    )
+    batches: list[str] = Field(
+        ..., description="核验时存活批次身份（batch_id，按原导入顺序）"
+    )
+    defects: list[DeliveryDefectMarkOut] = Field(
+        ..., description="核验时全部瑕疵标记（位置与类型，按批次原导入顺序、位置升序）"
+    )
+
+
+class DeliveryCheckOut(BaseModel):
+    check_id: str | None = Field(
+        ..., description="交付核验凭证 ID；阻断项非空、未签发时为 null"
+    )
+    roll_no: str
+    issued: bool = Field(
+        ..., description="是否已签发持久化凭证（仅三类阻断项全空时签发）"
+    )
+    repeated: bool = Field(
+        ..., description="True=同一状态重复申请，返回的是此前签发的原凭证"
+    )
+    state_fingerprint: str = Field(
+        ..., description="核验时状态指纹（覆盖存活批次身份、瑕疵位置与类型）"
+    )
+    blocking: DeliveryBlockingOut = Field(..., description="三类阻断项明细")
+    basis: DeliveryBasisOut = Field(
+        ..., description="核验依据；签发时冻结入库，未签发时为本次实时计算值（不落库）"
+    )
+    issued_at: str | None = Field(
+        ..., description="凭证签发时间（UTC ISO-8601）；未签发时为 null"
+    )
+
+
+class DeliveryCheckStatusOut(BaseModel):
+    check_id: str
+    roll_no: str
+    valid: bool = Field(
+        ...,
+        description="按当前状态重算的有效性：签发后批次或瑕疵标记有任何变化即失效",
+    )
+    state_fingerprint: str = Field(..., description="签发时冻结的状态指纹")
+    current_state_fingerprint: str = Field(
+        ..., description="按当前状态重算的指纹；与冻结指纹一致时凭证有效"
+    )
+    basis: DeliveryBasisOut = Field(
+        ..., description="签发时冻结的核验依据（历史凭证不改写）"
+    )
+    issued_at: str = Field(..., description="凭证签发时间（UTC ISO-8601）")
+    checked_at: str = Field(..., description="本次有效性重算时间（UTC ISO-8601）")
+
+
 class RollState(BaseModel):
     roll_no: str
     expected_ranges: list[list[int]]
