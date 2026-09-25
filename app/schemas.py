@@ -212,6 +212,116 @@ class DefectQueueOut(BaseModel):
     )
 
 
+# ---------- 胶卷交付核验 ----------
+
+class DeliveryCheckBatch(BaseModel):
+    batch_id: str = Field(..., description="签发时存活批次的身份（按原导入顺序）")
+    content_hash: str = Field(..., description="该批次内容指纹（预期范围 + 帧号集合）")
+
+
+class DeliveryCheckDefect(BaseModel):
+    batch_id: str = Field(..., description="瑕疵标记所在批次")
+    position: int = Field(..., description="瑕疵在该批原始帧列表中的位置（0 起算）")
+    frame_no: int = Field(..., description="该位置对应的扫描帧号")
+    defect_type: DefectType
+
+
+class DeliveryCheckOut(BaseModel):
+    """交付核验结果：未签发时仅返回三类阻断项；签发成功/同状态重放时携带凭证。"""
+
+    delivery_check_id: str | None = Field(
+        ..., description="凭证 ID；存在阻断项未签发时为 null"
+    )
+    roll_no: str
+    issued: bool = Field(
+        ..., description="是否签发持久化凭证（三类阻断项全空才为 true）"
+    )
+    repeated: bool = Field(
+        ..., description="True=同一状态重复申请，返回已签发的原凭证而非新建"
+    )
+    missing_ranges: list[list[int]] = Field(
+        ..., description="阻断项一：预期覆盖内的连续缺帧闭区间"
+    )
+    out_of_range_frames: list[int] = Field(
+        ..., description="阻断项二：落在全部预期覆盖之外的实扫帧（去重排序）"
+    )
+    defect_frames: list[int] = Field(
+        ...,
+        description="阻断项三：全部有效扫描出现均被标记瑕疵的帧号（按帧号升序）",
+    )
+    expected_ranges: list[list[int]] | None = Field(
+        ..., description="签发/重放时冻结的预期覆盖闭区间；未签发时为 null"
+    )
+    frames: list[int] | None = Field(
+        ..., description="签发/重放时冻结的实扫帧（去重排序）；未签发时为 null"
+    )
+    batches: list[DeliveryCheckBatch] | None = Field(
+        ..., description="签发/重放时冻结的存活批次身份；未签发时为 null"
+    )
+    defects: list[DeliveryCheckDefect] | None = Field(
+        ...,
+        description="签发/重放时冻结的全部瑕疵标记（批次身份、0 起算位置与类型）；"
+        "未签发时为 null",
+    )
+    state_fingerprint: str | None = Field(
+        ...,
+        description="签发/重放时冻结的状态指纹（存活批次身份 + 瑕疵位置与类型的"
+        "SHA-256）；未签发时为 null",
+    )
+    created_at: str | None = Field(
+        ..., description="凭证签发时间（UTC ISO-8601）；未签发时为 null"
+    )
+
+
+class DeliveryCheckDetailOut(BaseModel):
+    """凭证查询：返回冻结的签发依据，并按当前批次与瑕疵标记重算有效性。"""
+
+    delivery_check_id: str
+    roll_no: str
+    currently_valid: bool = Field(
+        ...,
+        description="当前状态指纹是否与签发时一致：批次导入/撤销或瑕疵标记变化即为 false；"
+        "历史凭证不会因此被改写",
+    )
+    # 签发依据（历史冻结，永不改写；签发时三类阻断项全空故恒为空列表）
+    issued_missing_ranges: list[list[int]] = Field(
+        ..., description="签发依据：预期内缺帧区间（签发时为空）"
+    )
+    issued_out_of_range_frames: list[int] = Field(
+        ..., description="签发依据：预期外帧（签发时为空）"
+    )
+    issued_defect_frames: list[int] = Field(
+        ..., description="签发依据：全出现被标记瑕疵的帧（签发时为空）"
+    )
+    expected_ranges: list[list[int]] = Field(
+        ..., description="签发依据：签发时冻结的预期覆盖闭区间"
+    )
+    frames: list[int] = Field(
+        ..., description="签发依据：签发时冻结的实扫帧（去重排序）"
+    )
+    batches: list[DeliveryCheckBatch] = Field(
+        ..., description="签发依据：签发时存活批次的身份"
+    )
+    defects: list[DeliveryCheckDefect] = Field(
+        ..., description="签发依据：签发时全部瑕疵标记（位置与类型）"
+    )
+    state_fingerprint: str = Field(..., description="签发时冻结的状态指纹")
+    created_at: str = Field(..., description="凭证签发时间（UTC ISO-8601）")
+    # 按当前状态实时重算（只用于呈现凭证为何失效，不修改凭证）
+    current_state_fingerprint: str = Field(
+        ..., description="查询时按存活批次与瑕疵标记重算的状态指纹"
+    )
+    current_missing_ranges: list[list[int]] = Field(
+        ..., description="查询时重算的预期内缺帧区间（胶卷无存活批次时为 []）"
+    )
+    current_out_of_range_frames: list[int] = Field(
+        ..., description="查询时重算的预期外帧（胶卷无存活批次时为 []）"
+    )
+    current_defect_frames: list[int] = Field(
+        ..., description="查询时重算的全出现被标记瑕疵帧（胶卷无存活批次时为 []）"
+    )
+
+
 class RollState(BaseModel):
     roll_no: str
     expected_ranges: list[list[int]]

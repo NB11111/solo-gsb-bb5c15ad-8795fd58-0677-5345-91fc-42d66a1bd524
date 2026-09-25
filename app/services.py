@@ -1590,3 +1590,334 @@ def get_defect_queue(
         if total[frame_no] > 0 and marked.get(frame_no, 0) == total[frame_no]
     ]
     return schemas.DefectQueueOut(roll_no=roll_no, frames=queued)
+
+
+# ---------- 胶卷交付核验 ----------
+
+class DeliveryCheckNotFoundError(Exception):
+    """交付核验凭证不存在。"""
+
+    def __init__(self, check_id: str):
+        self.check_id = check_id
+        super().__init__(f"交付核验凭证不存在: {check_id}")
+
+
+def _delivery_state_fingerprint(
+    roll_no: str,
+    batches: list[tuple[str, str]],
+    defects: list[tuple[str, int, str]],
+) -> str:
+    """交付核验状态指纹：存活批次身份 + 瑕疵位置与类型的 SHA-256。
+
+    批次身份取 (batch_id, content_hash) 有序列表，覆盖批次的导入与撤销；
+    瑕疵标记取 (batch_id, position, defect_type) 有序列表，覆盖瑕疵登记、
+    清空与类型变更（位置由批次原始列表 0 起算）。批次或瑕疵标记任一变化
+    指纹即变，历史凭证据此重算有效性但不改写。
+    """
+    payload = json.dumps(
+        {
+            "roll_no": roll_no,
+            "batches": [[bid, ch] for bid, ch in batches],
+            "defects": [[bid, pos, dtype] for bid, pos, dtype in defects],
+        },
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _empty_delivery_state(roll_no: str) -> dict:
+    """胶卷无存活批次时（最后一批已撤销）的空核验状态。"""
+    return {
+        "roll_no": roll_no,
+        "exists": False,
+        "expected": [],
+        "frames": set(),
+        "missing": [],
+        "out_of_range": [],
+        "defect_frames": [],
+        "batches": [],          # [(batch_id, content_hash)]
+        "defects": [],          # [(batch_id, position, defect_type)]
+        "defects_by_batch": {}, # {batch_id: [{position, frame_no, defect_type}]}
+        "fingerprint": _delivery_state_fingerprint(roll_no, [], []),
+    }
+
+
+def _load_delivery_state(
+    conn: sqlite3.Connection, roll_no: str
+) -> dict:
+    """在当前事务内读取交付核验所需的全部依据。
+
+    一次读取：预期覆盖（roll_expected）、实扫帧（roll_frames）、存活批次
+    身份（batches，按原导入顺序）与瑕疵标记（batch_defects，位置与类型）。
+    瑕疵阻断帧的判定口径与 ``get_defect_queue`` 完全一致：按存活批次原始
+    列表逐个扫描出现计数，全部出现均被标记才计入；旧批次（无原始列表）
+    的去重帧按一次未标记出现处理，凡被其扫到的帧均不构成瑕疵阻断项。
+    """
+    expected = _expected_ranges(conn, roll_no)
+    frames = _all_frames(conn, roll_no)
+
+    batch_rows = conn.execute(
+        """SELECT id, content_hash, raw_frames_json, frames_json
+             FROM batches
+            WHERE roll_no = ?
+            ORDER BY created_at, rowid""",
+        (roll_no,),
+    ).fetchall()
+
+    batches: list[tuple[str, str]] = []
+    defects: list[tuple[str, int, str]] = []
+    defects_by_batch: dict[str, list[dict]] = {}
+
+    # 与瑕疵队列同口径：frame -> [总出现次数, 已标记出现次数]
+    total_occ: dict[int, int] = {}
+    marked_occ: dict[int, int] = {}
+
+    for br in batch_rows:
+        batches.append((br["id"], br["content_hash"]))
+        has_raw = br["raw_frames_json"] is not None
+        raw_frames: list[int] = (
+            json.loads(br["raw_frames_json"])
+            if has_raw
+            else json.loads(br["frames_json"])
+        )
+        defect_rows = conn.execute(
+            "SELECT position, defect_type FROM batch_defects WHERE batch_id = ?",
+            (br["id"],),
+        ).fetchall()
+        marked_positions = {row["position"]: row["defect_type"] for row in defect_rows}
+
+        batch_defects: list[dict] = []
+        for idx, frame_no in enumerate(raw_frames):
+            total_occ[frame_no] = total_occ.get(frame_no, 0) + 1
+            if has_raw and idx in marked_positions:
+                marked_occ[frame_no] = marked_occ.get(frame_no, 0) + 1
+                dtype = marked_positions[idx]
+                defects.append((br["id"], idx, dtype))
+                batch_defects.append(
+                    {"position": idx, "frame_no": frame_no, "defect_type": dtype}
+                )
+        if batch_defects:
+            defects_by_batch[br["id"]] = batch_defects
+
+    # 指纹要求规范有序（与批次/瑕疵的持久化顺序无关）：批次与瑕疵分别排序后入指纹；
+    # batches 本身保留原导入顺序供响应使用，defects_by_batch 保留各批位置顺序
+    fingerprint = _delivery_state_fingerprint(
+        roll_no, sorted(batches), sorted(defects, key=lambda x: (x[0], x[1]))
+    )
+
+    defect_frames = sorted(
+        f for f in total_occ if marked_occ.get(f, 0) == total_occ[f]
+    )
+
+    return {
+        "roll_no": roll_no,
+        "exists": bool(batch_rows),
+        "expected": expected,
+        "frames": frames,
+        "missing": missing_intervals(expected, frames),
+        "out_of_range": out_of_range_frames(expected, frames),
+        "defect_frames": defect_frames,
+        "batches": batches,
+        "defects": defects,
+        "defects_by_batch": defects_by_batch,
+        "fingerprint": fingerprint,
+    }
+
+
+def _delivery_defect_out(state: dict) -> list[schemas.DeliveryCheckDefect]:
+    """把冻结的瑕疵标记按（批次原导入顺序, 位置）展开为响应项。"""
+    batch_order = [bid for bid, _ in state["batches"]]
+    out: list[schemas.DeliveryCheckDefect] = []
+    for bid in batch_order:
+        for item in state["defects_by_batch"].get(bid, []):
+            out.append(
+                schemas.DeliveryCheckDefect(
+                    batch_id=bid,
+                    position=item["position"],
+                    frame_no=item["frame_no"],
+                    defect_type=item["defect_type"],
+                )
+            )
+    return out
+
+
+def _delivery_out_from_row(
+    row: sqlite3.Row, *, repeated: bool
+) -> schemas.DeliveryCheckOut:
+    """从已签发凭证行组装 POST 响应（凭证只在阻断项全空时签发，阻断项恒为空）。"""
+    batches = [
+        schemas.DeliveryCheckBatch(batch_id=bid, content_hash=ch)
+        for bid, ch in json.loads(row["batches_json"])
+    ]
+    defects = [
+        schemas.DeliveryCheckDefect(**item)
+        for item in json.loads(row["defects_json"])
+    ]
+    return schemas.DeliveryCheckOut(
+        delivery_check_id=row["id"],
+        roll_no=row["roll_no"],
+        issued=True,
+        repeated=repeated,
+        # 凭证只在三类阻断项全空时签发，签发依据冻结为空
+        missing_ranges=[],
+        out_of_range_frames=[],
+        defect_frames=[],
+        expected_ranges=json.loads(row["expected_json"]),
+        frames=json.loads(row["frames_json"]),
+        batches=batches,
+        defects=defects,
+        state_fingerprint=row["state_fingerprint"],
+        created_at=row["created_at"],
+    )
+
+
+def _blocked_delivery_out(state: dict) -> schemas.DeliveryCheckOut:
+    return schemas.DeliveryCheckOut(
+        delivery_check_id=None,
+        roll_no=state["roll_no"],
+        issued=False,
+        repeated=False,
+        missing_ranges=[list(x) for x in state["missing"]],
+        out_of_range_frames=state["out_of_range"],
+        defect_frames=state["defect_frames"],
+        expected_ranges=None,
+        frames=None,
+        batches=None,
+        defects=None,
+        state_fingerprint=None,
+        created_at=None,
+    )
+
+
+def create_delivery_check(
+    conn: sqlite3.Connection, roll_no: str
+) -> tuple[schemas.DeliveryCheckOut, int]:
+    """申请胶卷交付核验：在同一 SQLite 事务内读取依据并判定是否签发凭证。
+
+    BEGIN IMMEDIATE 与并发批次导入/撤销/瑕疵登记串行化，事务内一次性读取
+    预期覆盖、实扫帧、存活批次与瑕疵标记，保证三类阻断项与冻结依据来自
+    同一状态：
+
+    - 任一阻断项非空：不签发、不写库，返回 ``200``（``issued=false``）及
+      三类阻断项（预期内缺帧区间、预期外帧、全部扫描出现均被标记瑕疵的帧）；
+    - 三类全空：签发持久化凭证，冻结预期覆盖、实扫帧、存活批次身份与全部
+      瑕疵标记，及“批次身份 + 瑕疵位置与类型”的状态指纹，返回 ``201``；
+    - 同一状态（指纹相同）重复申请：返回已签发的原凭证（``200``、
+      ``repeated=true``），不新建凭证；
+    - 胶卷不存在（尚未导入任何批次，或最后一批已被撤销）→
+      RollNotFoundError（接口 404）。
+    """
+    roll_no = roll_no.strip()
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if not _roll_exists(conn, roll_no):
+            raise RollNotFoundError(roll_no)
+        state = _load_delivery_state(conn, roll_no)
+
+        blocked = bool(
+            state["missing"] or state["out_of_range"] or state["defect_frames"]
+        )
+        if blocked:
+            conn.execute("ROLLBACK")
+            return _blocked_delivery_out(state), 200
+
+        existing = conn.execute(
+            "SELECT * FROM delivery_checks WHERE roll_no = ? AND state_fingerprint = ?",
+            (roll_no, state["fingerprint"]),
+        ).fetchone()
+        if existing is not None:
+            conn.execute("ROLLBACK")
+            return _delivery_out_from_row(existing, repeated=True), 200
+
+        check_id = uuid.uuid4().hex
+        now = _now_iso()
+        frozen_defects = [
+            item.model_dump()
+            for item in _delivery_defect_out(state)
+        ]
+        conn.execute(
+            """INSERT INTO delivery_checks
+                   (id, roll_no, expected_json, frames_json, batches_json,
+                    defects_json, state_fingerprint, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                check_id,
+                roll_no,
+                json.dumps([list(x) for x in state["expected"]]),
+                json.dumps(sorted(state["frames"])),
+                json.dumps([list(x) for x in state["batches"]], ensure_ascii=False),
+                json.dumps(frozen_defects, ensure_ascii=False),
+                state["fingerprint"],
+                now,
+            ),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+    row = conn.execute(
+        "SELECT * FROM delivery_checks WHERE id = ?", (check_id,)
+    ).fetchone()
+    assert row is not None
+    return _delivery_out_from_row(row, repeated=False), 201
+
+
+def get_delivery_check(
+    conn: sqlite3.Connection, check_id: str
+) -> schemas.DeliveryCheckDetailOut:
+    """返回凭证签发依据，并按当前状态重算有效性（凭证本身永不改写）。
+
+    在一次只读事务内重算当前“批次身份 + 瑕疵位置与类型”的状态指纹：
+
+    - 与签发时一致 → ``currently_valid=true``；
+    - 批次导入/撤销或瑕疵标记发生变化 → ``currently_valid=false``；
+      同时返回按当前状态重算的三类阻断项供核对；
+    - 胶卷最后一批已被撤销时，当前状态按空状态处理，指纹不再相等，
+      凭证标记为失效但仍可查询、不被改写；
+    - 凭证不存在 → DeliveryCheckNotFoundError（接口 404）。
+    """
+    check_id = check_id.strip()
+    row = conn.execute(
+        "SELECT * FROM delivery_checks WHERE id = ?", (check_id,)
+    ).fetchone()
+    if row is None:
+        raise DeliveryCheckNotFoundError(check_id)
+
+    conn.execute("BEGIN")
+    try:
+        if _roll_exists(conn, row["roll_no"]):
+            current = _load_delivery_state(conn, row["roll_no"])
+        else:
+            current = _empty_delivery_state(row["roll_no"])
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+    return schemas.DeliveryCheckDetailOut(
+        delivery_check_id=row["id"],
+        roll_no=row["roll_no"],
+        currently_valid=current["fingerprint"] == row["state_fingerprint"],
+        issued_missing_ranges=[],
+        issued_out_of_range_frames=[],
+        issued_defect_frames=[],
+        expected_ranges=json.loads(row["expected_json"]),
+        frames=json.loads(row["frames_json"]),
+        batches=[
+            schemas.DeliveryCheckBatch(batch_id=bid, content_hash=ch)
+            for bid, ch in json.loads(row["batches_json"])
+        ],
+        defects=[
+            schemas.DeliveryCheckDefect(**item)
+            for item in json.loads(row["defects_json"])
+        ],
+        state_fingerprint=row["state_fingerprint"],
+        created_at=row["created_at"],
+        current_state_fingerprint=current["fingerprint"],
+        current_missing_ranges=[list(x) for x in current["missing"]],
+        current_out_of_range_frames=current["out_of_range"],
+        current_defect_frames=current["defect_frames"],
+    )

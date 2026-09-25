@@ -26,6 +26,11 @@ SQLite 写事务内复核指纹后再执行现有导入逻辑，状态已变则 
 曝光异常三类瑕疵（整体替换），胶卷瑕疵队列实时给出**全部有效扫描出现均被
 标记瑕疵**的帧及瑕疵出现次数；未提交瑕疵的批次与旧批次去重帧一律视为
 未标记扫描，批次撤销后只按存活批次重算并清理其标记。
+还提供**胶卷交付核验**：在同一 SQLite 事务内读取预期覆盖、实扫帧、存活
+批次与瑕疵标记，汇总三类阻断项（预期内缺帧区间、预期外帧、全部扫描出现均
+被标记瑕疵的帧）；仅当三类全空时签发持久化凭证，冻结核验依据及包含批次
+身份、瑕疵位置与类型的状态指纹，同一状态重复申请返回原凭证；凭证可随时
+查询，按当前批次与瑕疵标记实时重算有效性，状态变化即失效、历史凭证不改写。
 
 技术栈：Python + FastAPI + SQLite（单文件库，零外部依赖）。
 
@@ -581,6 +586,136 @@ curl http://localhost:8000/batches/b-2026-001/quality
   无法按原始顺序评估 → `409 Conflict`（与批次撤销的旧数据规则一致），
   数据不发生任何变化。
 
+### 14. 胶卷交付核验
+
+胶卷正式交付前申请核验：服务在**同一个 `BEGIN IMMEDIATE` SQLite 事务**内读取
+该胶卷的**预期覆盖、实扫帧、存活批次与瑕疵标记**，汇总三类交付阻断项：
+
+1. **预期内缺帧区间**：合并后的预期覆盖内未被实扫帧覆盖的连续闭区间；
+2. **预期外帧**：落在全部预期覆盖之外的实扫帧；
+3. **全出现被标记瑕疵的帧**：与瑕疵队列（15.2）同口径——某帧在存活批次
+   原始列表中的全部扫描出现均已登记瑕疵标记才计入，同帧任一出现未标记
+   （未提交瑕疵的批次、旧批次去重帧）即不计入。
+
+#### 14.1 申请核验（签发凭证）
+
+```bash
+curl -X POST http://localhost:8000/rolls/R-001/delivery-checks
+```
+
+接口无请求体。
+
+**存在阻断项（不签发，`200 OK`）**：三类阻断项任一非空时**不写库、不签发**，
+返回 `200 OK` 与三类阻断项明细（`issued=false`、`delivery_check_id=null`、
+凭证字段均为 `null`）：
+
+```json
+{
+  "delivery_check_id": null,
+  "roll_no": "R-001",
+  "issued": false,
+  "repeated": false,
+  "missing_ranges": [[4, 4], [6, 7]],
+  "out_of_range_frames": [20],
+  "defect_frames": [5],
+  "expected_ranges": null,
+  "frames": null,
+  "batches": null,
+  "defects": null,
+  "state_fingerprint": null,
+  "created_at": null
+}
+```
+
+**核验通过（签发凭证，`201 Created`）**：三类阻断项全空时签发**持久化凭证**，
+在同一事务内冻结**核验依据**——预期覆盖、实扫帧（去重排序）、存活批次身份
+（按原导入顺序的 `batch_id` 与内容指纹）及全部瑕疵标记（批次身份、0 起算
+位置、帧号与类型），并计算**状态指纹**：
+
+```json
+{
+  "delivery_check_id": "837f2536fbd24e61880c4ef1cb655fb7",
+  "roll_no": "R-001",
+  "issued": true,
+  "repeated": false,
+  "missing_ranges": [],
+  "out_of_range_frames": [],
+  "defect_frames": [],
+  "expected_ranges": [[1, 10]],
+  "frames": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+  "batches": [
+    {"batch_id": "b-2026-001", "content_hash": "9f2c…（64 位十六进制）"},
+    {"batch_id": "b-2026-002", "content_hash": "1a7b…（64 位十六进制）"}
+  ],
+  "defects": [
+    {"batch_id": "b-2026-002", "position": 0, "frame_no": 3, "defect_type": "模糊"}
+  ],
+  "state_fingerprint": "c2e1…（64 位十六进制）",
+  "created_at": "2026-09-25T09:00:00.000Z"
+}
+```
+
+状态指纹口径：对**存活批次身份**（排序后的 `batch_id + content_hash`）与
+**瑕疵位置和类型**（排序后的 `batch_id + position + defect_type`）做
+SHA-256。瑕疵标记即使没有形成阻断帧（例如共享帧只有部分出现被标记）也参与
+指纹——标记的增删与类型变更同样使凭证失效。
+
+**同一状态重复申请（幂等，`200 OK`）**：胶卷批次与瑕疵标记均未变化时再次
+申请，返回**首次签发的原凭证**（`repeated=true`、`delivery_check_id` 不变），
+不新建凭证、不改变签发时间。状态先变化后恢复到签发时状态（指纹重新相等）
+也视为同一状态，返回原凭证。
+
+- 胶卷不存在（尚未导入任何批次，或最后一批已被撤销）→ `404 Not Found`。
+- 凭证与业务数据同在一个 SQLite 库（`delivery_checks` 表，启动时幂等建表），
+  随 volume 保留；同一胶卷可在不同状态下签发多张凭证。
+
+#### 14.2 查询凭证（签发依据 + 当前有效性）
+
+```bash
+curl http://localhost:8000/delivery-checks/837f2536fbd24e61880c4ef1cb655fb7
+```
+
+返回签发时冻结的全部依据，并**按查询时的存活批次与瑕疵标记重算状态指纹**：
+两者一致 `currently_valid=true`，否则 `false`。响应同时给出按**当前**状态
+重算的指纹与三类阻断项，便于核对凭证为何失效；**历史凭证只读、永不改写**。
+
+```json
+{
+  "delivery_check_id": "837f2536fbd24e61880c4ef1cb655fb7",
+  "roll_no": "R-001",
+  "currently_valid": false,
+  "issued_missing_ranges": [],
+  "issued_out_of_range_frames": [],
+  "issued_defect_frames": [],
+  "expected_ranges": [[1, 10]],
+  "frames": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+  "batches": [
+    {"batch_id": "b-2026-001", "content_hash": "9f2c…"},
+    {"batch_id": "b-2026-002", "content_hash": "1a7b…"}
+  ],
+  "defects": [],
+  "state_fingerprint": "c2e1…（签发时指纹）",
+  "created_at": "2026-09-25T09:00:00.000Z",
+  "current_state_fingerprint": "77ad…（当前重算指纹）",
+  "current_missing_ranges": [],
+  "current_out_of_range_frames": [],
+  "current_defect_frames": [4]
+}
+```
+
+规则说明：
+
+- **失效条件**：签发后有批次导入/撤销（批次身份变化），或任何批次的瑕疵
+  标记发生增删、清空、类型变更，当前指纹即与签发时不一致，
+  `currently_valid=false`；签发依据各字段（`expected_ranges`、`frames`、
+  `batches`、`defects`、`state_fingerprint`、`created_at` 及三个
+  `issued_*` 阻断项）保持签发时的值，**不会被改写**。
+- **胶卷最后一批被撤销**：凭证仍可查询，当前按空状态处理，凭证标记为失效；
+  此时对该胶卷重新申请核验返回 `404`。
+- 凭证不存在（未知 ID）→ `404 Not Found`。
+- 凭证有效性只反映“批次与瑕疵标记是否变化”；签发依据中的三类阻断项恒为空
+  （只有全空才签发），当前是否重新出现阻断以 `current_*` 字段为准。
+
 ### 15. 扫描瑕疵复核
 
 档案员复核扫描件后，按**批次原始帧列表中 0 起算的位置**登记瑕疵，瑕疵类型
@@ -785,6 +920,24 @@ curl http://localhost:8000/health
     - 撤销批次时在同一写事务内**清理该批瑕疵标记**，队列只按存活批次重算；
       仅被撤销批次持有的帧不再出现，被多批扫到的帧按剩余出现重新判定。
       胶卷不存在（无存活批次）时队列接口返回 `404`。
+14. **胶卷交付核验**（`POST /rolls/{roll_no}/delivery-checks`、
+    `GET /delivery-checks/{check_id}`）：
+    - 申请核验在**同一 `BEGIN IMMEDIATE` SQLite 事务**内读取预期覆盖、实扫帧、
+      存活批次与瑕疵标记，返回三类阻断项：**预期内缺帧区间**（合并预期覆盖
+      扣除实扫帧的连续闭区间）、**预期外帧**、**全部扫描出现均被标记瑕疵的
+      帧**（口径与瑕疵队列一致：旧批次去重帧按一次未标记出现处理）。
+    - 三类阻断项全空才签发持久化凭证（`delivery_checks` 表，启动幂等建表）：
+      冻结**核验依据**（预期覆盖、实扫帧、存活批次身份 `batch_id +
+      content_hash`、全部瑕疵标记的批次身份/0 起算位置/帧号/类型）及
+      **状态指纹**（存活批次身份 + 瑕疵位置与类型的 SHA-256）。
+    - 存在阻断项时返回 `200`、`issued=false`，**不写库、不签发**；核验通过
+      返回 `201`；同一状态（指纹相同，含状态变化后恢复）重复申请返回原凭证
+      （`200`、`repeated=true`），不新建凭证；胶卷不存在返回 `404`。
+    - 查询凭证返回冻结的签发依据，并按当前存活批次与瑕疵标记重算状态指纹：
+      批次导入/撤销或瑕疵标记（含非阻断性标记的增删与类型变更）变化即
+      `currently_valid=false`，同时给出按当前状态重算的 `current_*` 阻断项；
+      **历史凭证只读、永不改写**。胶卷最后一批被撤销后凭证仍可查询（当前按
+      空状态，标记失效），凭证不存在返回 `404`。
 
 ## 本地非 Docker 运行（开发用）
 

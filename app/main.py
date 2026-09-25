@@ -20,8 +20,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="胶片档案扫描整理 API",
-    description="按胶卷汇总扫描帧、去重、统计预期范围内的连续缺帧；批次导入幂等；支持误导入批次撤销、补扫任务认领与补扫完成回执；支持交付快照及相对快照的区间级差异对比；支持单批次采集质量审查（批内重复率、越界帧、预期内缺口及稳定告警代码）；支持批次导入预检（持久化预检单、状态指纹复核后确认导入）；支持扫描瑕疵复核（按原始帧列表 0 起算位置登记模糊/划痕/曝光异常，实时计算全出现被标记的瑕疵队列）。",
-    version="1.8.0",
+    description="按胶卷汇总扫描帧、去重、统计预期范围内的连续缺帧；批次导入幂等；支持误导入批次撤销、补扫任务认领与补扫完成回执；支持交付快照及相对快照的区间级差异对比；支持单批次采集质量审查（批内重复率、越界帧、预期内缺口及稳定告警代码）；支持批次导入预检（持久化预检单、状态指纹复核后确认导入）；支持扫描瑕疵复核（按原始帧列表 0 起算位置登记模糊/划痕/曝光异常，实时计算全出现被标记的瑕疵队列）；支持胶卷交付核验（同一事务内核验三类阻断项，全空时签发冻结核验依据与状态指纹的持久化凭证，凭证按当前批次与瑕疵标记重算有效性，历史凭证不改写）。",
+    version="1.9.0",
     lifespan=lifespan,
 )
 
@@ -293,6 +293,54 @@ def get_roll_defect_queue(
         return services.get_defect_queue(conn, roll_no.strip())
     except services.RollNotFoundError:
         raise HTTPException(status_code=404, detail="胶卷不存在（尚未导入任何批次）")
+
+
+@app.post(
+    "/rolls/{roll_no}/delivery-checks",
+    response_model=schemas.DeliveryCheckOut,
+    status_code=status.HTTP_201_CREATED,
+    tags=["胶卷交付核验"],
+)
+def create_delivery_check(
+    roll_no: str,
+    response: Response,
+    conn: Connection = Depends(database.get_db),
+):
+    """申请胶卷交付核验：在同一 SQLite 事务内读取预期覆盖、实扫帧、存活批次
+    与瑕疵标记，返回三类阻断项——预期内缺帧区间、预期外帧、全部扫描出现均被
+    标记瑕疵的帧。
+
+    - 任一阻断项非空：不签发、不写库，返回 ``200``（``issued=false``）及三类阻断项；
+    - 三类全空：签发持久化凭证（``201``），冻结核验依据及包含批次身份、瑕疵
+      位置与类型的状态指纹；
+    - 同一状态重复申请返回原凭证（``200``、``repeated=true``）；
+    - 胶卷不存在（尚未导入任何批次，或最后一批已被撤销）返回 ``404``。
+    """
+    try:
+        result, code = services.create_delivery_check(conn, roll_no.strip())
+    except services.RollNotFoundError:
+        raise HTTPException(status_code=404, detail="胶卷不存在（尚未导入任何批次）")
+    response.status_code = code
+    return result
+
+
+@app.get(
+    "/delivery-checks/{check_id}",
+    response_model=schemas.DeliveryCheckDetailOut,
+    tags=["胶卷交付核验"],
+)
+def get_delivery_check(check_id: str, conn: Connection = Depends(database.get_db)):
+    """返回交付核验凭证的签发依据，并按当前状态重算有效性。
+
+    历史凭证只读、不改写：批次导入/撤销或瑕疵标记变化即
+    ``currently_valid=false``（同时给出按当前状态重算的三类阻断项）；
+    胶卷最后一批被撤销后当前按空状态处理，凭证失效但仍可查询。
+    凭证不存在返回 ``404``。
+    """
+    try:
+        return services.get_delivery_check(conn, check_id.strip())
+    except services.DeliveryCheckNotFoundError:
+        raise HTTPException(status_code=404, detail="交付核验凭证不存在")
 
 
 @app.post(

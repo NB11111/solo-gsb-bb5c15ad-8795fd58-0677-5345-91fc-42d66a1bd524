@@ -147,6 +147,27 @@ CREATE TABLE IF NOT EXISTS batch_defects (
     PRIMARY KEY (batch_id, position),
     FOREIGN KEY (batch_id) REFERENCES batches (id) ON DELETE CASCADE
 );
+
+-- 胶卷交付核验凭证：仅当三类阻断项（预期内缺帧区间、预期外帧、全部扫描出现均被
+-- 标记瑕疵的帧）全空时签发。签发时冻结核验依据（预期覆盖、实扫帧、存活批次身份、
+-- 瑕疵标记）与状态指纹（存活批次身份 + 瑕疵位置与类型的 SHA-256）。
+-- (roll_no, state_fingerprint) 唯一：同一状态重复申请直接返回原凭证，不重复签发。
+-- 凭证只新增、从不改写；GET 时按当前批次与瑕疵标记重算指纹，不一致即失效。
+CREATE TABLE IF NOT EXISTS delivery_checks (
+    id                TEXT PRIMARY KEY,
+    roll_no           TEXT NOT NULL,
+    expected_json     TEXT NOT NULL,
+    frames_json       TEXT NOT NULL,
+    batches_json      TEXT NOT NULL,
+    defects_json      TEXT NOT NULL,
+    state_fingerprint TEXT NOT NULL,
+    created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_delivery_checks_roll ON delivery_checks (roll_no);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_checks_state
+    ON delivery_checks (roll_no, state_fingerprint);
 """
 
 
